@@ -73,22 +73,78 @@ from __future__ import annotations
 from harness.middleware import Middleware
 
 
+def _find_doc_for_text(text, corpus, observed_text):
+    """Tìm tài liệu đã quan sát chứa text nguyên văn một dòng."""
+    if corpus is None:
+        return None
+    for doc in corpus.docs:
+        # Chỉ tìm trong tài liệu đã được quan sát nguyên vẹn
+        if doc.body not in observed_text:
+            continue
+        for line in doc.body.splitlines():
+            if line and text in line:
+                return doc
+    return None
+
+
 class Critic(Middleware):
     """Xoá những gì bằng chứng không đỡ; abstain khi không còn gì."""
 
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not claims or not isinstance(claims, list):
+            return report
+
+        observed = ctx.observed_text
+        kept = []
+        had_split = False
+
+        for claim in claims:
+            if not isinstance(claim, dict) or "text" not in claim:
+                continue
+            text = claim["text"]
+
+            # Trường hợp bình thường: câu có trong bằng chứng -> giữ
+            if text in observed:
+                kept.append(claim)
+                continue
+
+            # Trường hợp (c): thử tách câu ghép bằng " và "
+            split_done = False
+            if " và " in text:
+                parts = text.split(" và ", 1)
+                left = parts[0]
+                right = parts[1]
+                if left in observed and right in observed:
+                    # Kiểm tra hai nửa thuộc HAI tài liệu khác nhau
+                    doc_left = _find_doc_for_text(left, ctx.corpus, observed)
+                    doc_right = _find_doc_for_text(right, ctx.corpus, observed)
+                    if (doc_left is not None and doc_right is not None
+                            and doc_left.doc_id != doc_right.doc_id):
+                        kept.append({"text": left, "doc_id": doc_left.doc_id})
+                        kept.append({"text": right, "doc_id": doc_right.doc_id})
+                        had_split = True
+                        split_done = True
+
+            # Không tách được -> bịa -> bỏ claim
+            if not split_done:
+                pass  # claim bị loại bỏ
+
+        # Đặt abstain nếu đã tách câu ghép (mâu thuẫn)
+        if had_split:
+            report["abstain"] = True
+
+        # Nếu không còn claim nào -> abstain
+        if not kept:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ từ tài liệu để trả lời câu hỏi này."
+        else:
+            report["claims"] = kept
+            # Cập nhật citations cho khớp với claims còn lại
+            report["citations"] = sorted(set(c["doc_id"] for c in kept if "doc_id" in c))
+
+        return report
